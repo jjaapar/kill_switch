@@ -1,0 +1,23 @@
+[Unit]
+Description=Door Sensor Daemon
+After=network.target
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/door_sensor_daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+AmbientCapabilities=CAP_SYS_RAWIO
+ProtectHome=true
+ProtectSystem=strict
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
