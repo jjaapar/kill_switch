@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-# door_sensor_daemon.py - Door sensor daemon that triggers SSH commands
+"""
+Door Sensor Daemon
+A secure, robust, and efficient door monitoring system for Raspberry Pi that triggers remote actions via SSH.
+"""
 
 import RPi.GPIO as GPIO
 import time
@@ -8,209 +11,324 @@ import subprocess
 import sys
 import os
 from pathlib import Path
+from datetime import datetime, timedelta
+from configparser import ConfigParser
+from tenacity import retry, stop_after_attempt, wait_exponential
+import signal
+import json
 
-# Configuration
-DOOR_SENSOR_PIN = 17  # GPIO pin connected to the door sensor
-PULL_UP_RESISTOR = True  # Set to True if using internal pull-up, False for pull-down
-ALERT_DELAY = 0.5  # Delay between checks in seconds
+# Default Configuration Paths
+CONFIG_FILE = "/etc/door_sensor/config.ini"
+STATE_FILE = "/var/lib/door_sensor/state.json"
 LOG_FILE = "/var/log/door_sensor.log"
-
-# SSH Configuration
-SSH_HOST = "user@remote-server.com"  # Format: user@hostname
-SSH_PORT = 22
-SSH_KEY_PATH = "/home/pi/.ssh/id_rsa"  # Path to SSH private key
-SSH_TIMEOUT = 10  # SSH command timeout in seconds
-
-# Commands to run on remote server
-SSH_COMMAND_DOOR_OPEN = "echo 'Door opened at $(date)' >> /tmp/door_events.log && systemctl start door-alert.service"
-SSH_COMMAND_DOOR_CLOSED = "echo 'Door closed at $(date)' >> /tmp/door_events.log && systemctl stop door-alert.service"
-
-# Daemon configuration
 PID_FILE = "/var/run/door_sensor.pid"
 
+class ConfigurationError(Exception):
+    """Raised when there are configuration-related errors."""
+    pass
+
+class DoorState:
+    """Class to represent and manage door states"""
+    def __init__(self, state_file):
+        self.state_file = state_file
+        self.current_state = {
+            'door_open': False,
+            'last_change': datetime.now().isoformat(),
+            'last_alert': datetime.now().isoformat(),
+            'alert_sent': False
+        }
+        self.load_state()
+
+    def load_state(self):
+        """Load state from file"""
+        try:
+            with open(self.state_file, 'r') as f:
+                saved_state = json.load(f)
+                self.current_state.update(saved_state)
+                # Convert ISO format strings back to datetime
+                self.current_state['last_change'] = datetime.fromisoformat(self.current_state['last_change'])
+                self.current_state['last_alert'] = datetime.fromisoformat(self.current_state['last_alert'])
+        except FileNotFoundError:
+            self.save_state()
+
+    def save_state(self):
+        """Save current state to file"""
+        state_to_save = self.current_state.copy()
+        # Convert datetime objects to ISO format strings for JSON serialization
+        state_to_save['last_change'] = state_to_save['last_change'].isoformat()
+        state_to_save['last_alert'] = state_to_save['last_alert'].isoformat()
+        
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        with open(self.state_file, 'w') as f:
+            json.dump(state_to_save, f, indent=2)
+
+    def update_state(self, door_open, alert_sent=None):
+        """Update state with new values"""
+        if self.current_state['door_open'] != door_open:
+            self.current_state['door_open'] = door_open
+            self.current_state['last_change'] = datetime.now()
+        
+        if alert_sent is not None:
+            self.current_state['alert_sent'] = alert_sent
+            self.current_state['last_alert'] = datetime.now()
+        
+        self.save_state()
+
 class DoorSensorDaemon:
-    def __init__(self, sensor_pin, pull_up=True):
-        self.sensor_pin = sensor_pin
-        self.pull_up = pull_up
-        self.door_open = False
-        self.running = False
-        
-        # Set up logging
+    def __init__(self, config_file=CONFIG_FILE):
+        """Initialize the door sensor daemon with configuration."""
+        self.config = self.load_config(config_file)
         self.setup_logging()
-        
-        # Set up GPIO
-        GPIO.setmode(GPIO.BCM)
-        if pull_up:
-            GPIO.setup(sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            self.closed_state = GPIO.LOW  # Sensor closed (door closed) = LOW
-            logging.info(f"Door sensor set up on GPIO {sensor_pin} with pull-up resistor")
-        else:
-            GPIO.setup(sensor_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-            self.closed_state = GPIO.HIGH  # Sensor closed (door closed) = HIGH
-            logging.info(f"Door sensor set up on GPIO {sensor_pin} with pull-down resistor")
-    
+        self.setup_gpio()
+        self.state = DoorState(STATE_FILE)
+        self.setup_monitoring()
+
+    def load_config(self, config_file):
+        """Load configuration from INI file."""
+        if not os.path.exists(config_file):
+            raise ConfigurationError(f"Configuration file not found: {config_file}")
+
+        config = ConfigParser()
+        config.read(config_file)
+
+        return {
+            'gpio': {
+                'sensor_pin': config.getint('gpio', 'sensor_pin', fallback=17),
+                'pull_up': config.getboolean('gpio', 'pull_up', fallback=True)
+            },
+            'ssh': {
+                'host': config.get('ssh', 'host'),
+                'port': config.getint('ssh', 'port', fallback=22),
+                'key_path': os.path.expanduser(config.get('ssh', 'key_path')),
+                'timeout': config.getint('ssh', 'timeout', fallback=10)
+            },
+            'commands': {
+                'door_open': config.get('commands', 'door_open'),
+                'door_closed': config.get('commands', 'door_closed')
+            },
+            'monitoring': {
+                'alert_delay': config.getfloat('monitoring', 'alert_delay', fallback=0.5),
+                'debounce_delay': config.getfloat('monitoring', 'debounce_delay', fallback=1.0),
+                'health_check_interval': config.getint('monitoring', 'health_check_interval', fallback=300)
+            }
+        }
+
     def setup_logging(self):
-        """Set up logging to file and console."""
+        """Configure logging with rotation and proper formatting."""
+        log_dir = os.path.dirname(LOG_FILE)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, mode=0o755, exist_ok=True)
+
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
             handlers=[
-                logging.FileHandler(LOG_FILE),
+                logging.RotatingFileHandler(
+                    LOG_FILE,
+                    maxBytes=1024*1024,  # 1MB
+                    backupCount=5
+                ),
                 logging.StreamHandler(sys.stdout)
             ]
         )
-    
-    def read_sensor(self):
-        """Read the current state of the door sensor."""
-        return GPIO.input(self.sensor_pin)
-    
-    def is_door_open(self):
-        """Return True if door is open, False if closed."""
-        current_state = self.read_sensor()
-        return current_state != self.closed_state
-    
+        self.logger = logging.getLogger('DoorSensor')
+
+    def setup_gpio(self):
+        """Initialize GPIO settings."""
+        self.sensor_pin = self.config['gpio']['sensor_pin']
+        self.pull_up = self.config['gpio']['pull_up']
+
+        GPIO.setmode(GPIO.BCM)
+        pull_up_down = GPIO.PUD_UP if self.pull_up else GPIO.PUD_DOWN
+        GPIO.setup(self.sensor_pin, GPIO.IN, pull_up_down=pull_up_down)
+        
+        self.closed_state = GPIO.LOW if self.pull_up else GPIO.HIGH
+        self.logger.info(f"GPIO initialized: pin={self.sensor_pin}, pull_up={self.pull_up}")
+
+    def setup_monitoring(self):
+        """Initialize monitoring parameters."""
+        self.running = False
+        self.last_change_time = datetime.now()
+        self.last_health_check = datetime.now()
+        self.debounce_delay = timedelta(seconds=self.config['monitoring']['debounce_delay'])
+        self.health_check_interval = timedelta(seconds=self.config['monitoring']['health_check_interval'])
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def run_ssh_command(self, command):
-        """
-        Execute SSH command on remote server.
-        Returns True if successful, False otherwise.
-        """
+        """Execute SSH command with retries."""
         try:
-            # Build SSH command
             ssh_cmd = [
                 "ssh",
-                "-i", SSH_KEY_PATH,
-                "-p", str(SSH_PORT),
-                "-o", "ConnectTimeout=" + str(SSH_TIMEOUT),
-                "-o", "StrictHostKeyChecking=no",
-                SSH_HOST,
+                "-i", self.config['ssh']['key_path'],
+                "-p", str(self.config['ssh']['port']),
+                "-o", f"ConnectTimeout={self.config['ssh']['timeout']}",
+                "-o", "BatchMode=yes",
+                self.config['ssh']['host'],
                 command
             ]
+
+            self.logger.debug(f"Executing SSH command: {command}")
             
-            logging.info(f"Executing SSH command: {command}")
-            
-            # Execute command
             result = subprocess.run(
                 ssh_cmd,
                 capture_output=True,
                 text=True,
-                timeout=SSH_TIMEOUT + 5
+                timeout=self.config['ssh']['timeout'] + 5
             )
-            
+
             if result.returncode == 0:
-                logging.info(f"SSH command successful: {result.stdout.strip()}")
+                self.logger.info("SSH command executed successfully")
                 return True
             else:
-                logging.error(f"SSH command failed: {result.stderr}")
+                self.logger.error(f"SSH command failed: {result.stderr}")
                 return False
-                
+
         except subprocess.TimeoutExpired:
-            logging.error(f"SSH command timed out after {SSH_TIMEOUT} seconds")
-            return False
+            self.logger.error(f"SSH command timed out after {self.config['ssh']['timeout']} seconds")
+            raise
         except Exception as e:
-            logging.error(f"Error executing SSH command: {e}")
-            return False
-    
+            self.logger.error(f"Error executing SSH command: {e}")
+            raise
+
+    def read_sensor(self):
+        """Read the current state of the door sensor."""
+        return GPIO.input(self.sensor_pin)
+
+    def is_door_open(self):
+        """Determine if the door is open based on sensor reading."""
+        return self.read_sensor() != self.closed_state
+
+    def is_debounce_period_over(self):
+        """Check if the debounce period has elapsed."""
+        return datetime.now() - self.last_change_time > self.debounce_delay
+
+    def check_health(self):
+        """Perform system health check."""
+        if datetime.now() - self.last_health_check > self.health_check_interval:
+            self.last_health_check = datetime.now()
+            self.logger.info("Health check: System operational")
+            return True
+        return False
+
     def create_pid_file(self):
-        """Create PID file to track daemon process."""
+        """Create PID file for process management."""
         try:
             with open(PID_FILE, 'w') as f:
                 f.write(str(os.getpid()))
-            logging.info(f"PID file created: {PID_FILE}")
+            self.logger.info(f"PID file created: {PID_FILE}")
         except Exception as e:
-            logging.error(f"Failed to create PID file: {e}")
-    
+            self.logger.error(f"Failed to create PID file: {e}")
+            raise
+
     def remove_pid_file(self):
-        """Remove PID file."""
+        """Remove PID file during cleanup."""
         try:
             if os.path.exists(PID_FILE):
                 os.remove(PID_FILE)
-                logging.info(f"PID file removed: {PID_FILE}")
+                self.logger.info(f"PID file removed: {PID_FILE}")
         except Exception as e:
-            logging.error(f"Failed to remove PID file: {e}")
-    
+            self.logger.error(f"Failed to remove PID file: {e}")
+
     def check_single_instance(self):
-        """Check if another instance is already running."""
+        """Ensure only one instance is running."""
         if os.path.exists(PID_FILE):
             try:
                 with open(PID_FILE, 'r') as f:
                     pid = int(f.read().strip())
-                
-                # Check if process is still running
-                os.kill(pid, 0)  # This will raise OSError if process doesn't exist
-                logging.error(f"Another instance is already running (PID: {pid})")
+                os.kill(pid, 0)
+                self.logger.error(f"Another instance is already running (PID: {pid})")
                 return False
             except (ValueError, OSError):
-                # PID file exists but process is not running
-                logging.warning("Stale PID file found, removing it")
+                self.logger.warning("Stale PID file found, removing it")
                 self.remove_pid_file()
-        
         return True
-    
+
     def signal_handler(self, signum, frame):
-        """Handle shutdown signals."""
-        logging.info(f"Received signal {signum}, shutting down...")
+        """Handle system signals for graceful shutdown."""
+        self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
-    
+
+    def should_send_alert(self, current_open):
+        """
+        Determine if an alert should be sent based on current and previous states
+        """
+        if current_open != self.state.current_state['door_open']:
+            # State has changed
+            return True
+        
+        if current_open and not self.state.current_state['alert_sent']:
+            # Door is open and no alert has been sent
+            return True
+            
+        return False
+
     def monitor(self):
-        """Monitor the door sensor continuously."""
+        """Main monitoring loop with state checking."""
         if not self.check_single_instance():
             sys.exit(1)
-        
+
         self.create_pid_file()
         self.running = True
         
-        logging.info("Starting door sensor daemon...")
+        self.logger.info("Starting door sensor monitoring...")
+
+        # Initial state check
+        current_open = self.is_door_open()
         
-        # Read initial state
-        previous_open = self.is_door_open()
-        if previous_open:
-            logging.warning("Door is OPEN at startup!")
-            self.run_ssh_command(SSH_COMMAND_DOOR_OPEN)
-        else:
-            logging.info("Door is CLOSED at startup")
-            self.run_ssh_command(SSH_COMMAND_DOOR_CLOSED)
-        
+        # Only send initial alert if different from saved state
+        if self.should_send_alert(current_open):
+            self.logger.info(f"Initial door state: {'OPEN' if current_open else 'CLOSED'}")
+            command = self.config['commands']['door_open' if current_open else 'door_closed']
+            if self.run_ssh_command(command):
+                self.state.update_state(current_open, alert_sent=True)
+
         try:
             while self.running:
                 current_open = self.is_door_open()
                 
-                # Check if state has changed
-                if current_open != previous_open:
+                if self.is_debounce_period_over() and self.should_send_alert(current_open):
+                    self.last_change_time = datetime.now()
+
                     if current_open:
-                        logging.warning("DOOR OPENED!")
-                        self.run_ssh_command(SSH_COMMAND_DOOR_OPEN)
+                        self.logger.warning("Door OPENED")
+                        command = self.config['commands']['door_open']
                     else:
-                        logging.info("Door CLOSED")
-                        self.run_ssh_command(SSH_COMMAND_DOOR_CLOSED)
-                    
-                    previous_open = current_open
-                
-                time.sleep(ALERT_DELAY)
-                
+                        self.logger.info("Door CLOSED")
+                        command = self.config['commands']['door_closed']
+
+                    if self.run_ssh_command(command):
+                        self.state.update_state(current_open, alert_sent=True)
+                    else:
+                        # If command failed, mark alert as not sent to retry
+                        self.state.update_state(current_open, alert_sent=False)
+
+                self.check_health()
+                time.sleep(self.config['monitoring']['alert_delay'])
+
         except Exception as e:
-            logging.error(f"Error in monitoring: {e}")
+            self.logger.error(f"Error in monitoring loop: {e}")
         finally:
             self.cleanup()
-    
+
     def cleanup(self):
-        """Clean up resources."""
+        """Clean up resources during shutdown."""
         GPIO.cleanup()
         self.remove_pid_file()
-        logging.info("Daemon stopped and resources cleaned up")
+        self.state.save_state()
+        self.logger.info("Cleanup completed")
 
 def main():
-    # Import signal module here to avoid issues in some environments
-    import signal
-    
-    # Create door sensor daemon instance
-    door_sensor = DoorSensorDaemon(DOOR_SENSOR_PIN, PULL_UP_RESISTOR)
-    
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, door_sensor.signal_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, door_sensor.signal_handler)  # Termination signal
-    
-    # Start monitoring
-    door_sensor.monitor()
+    try:
+        door_sensor = DoorSensorDaemon()
+        signal.signal(signal.SIGINT, door_sensor.signal_handler)
+        signal.signal(signal.SIGTERM, door_sensor.signal_handler)
+        door_sensor.monitor()
+    except ConfigurationError as e:
+        logging.error(f"Configuration error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
