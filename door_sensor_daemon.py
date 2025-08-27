@@ -10,12 +10,12 @@ import logging
 import subprocess
 import sys
 import os
+
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timedelta
 from configparser import ConfigParser
 from tenacity import retry, stop_after_attempt, wait_exponential
-import signal
-import json
 
 # Default Configuration Paths
 CONFIG_FILE = "/etc/door_sensor/config.ini"
@@ -123,7 +123,7 @@ class DoorSensorDaemon:
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
             handlers=[
-                logging.RotatingFileHandler(
+                RotatingFileHandler(
                     LOG_FILE,
                     maxBytes=1024*1024,  # 1MB
                     backupCount=5
