@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Door Sensor Script for Raspberry Pi 5
-Uses gpiod library for GPIO access on Pi 5
+Simple Door Sensor Script for Raspberry Pi 5
+Basic gpiod implementation
 """
 
 import gpiod
@@ -20,15 +20,9 @@ class DoorSensor:
             # Open GPIO chip
             self.chip = gpiod.Chip(CHIP_NAME)
             
-            # Request GPIO line with proper configuration
-            config = {
-                "consumer": "door_sensor",
-                "direction": gpiod.Line.Direction.INPUT,
-                "bias": gpiod.Line.Bias.PULL_UP if PULL_UP else gpiod.Line.Bias.PULL_DOWN
-            }
-            
+            # Request the GPIO line as input
             self.line = self.chip.get_line(GPIO_PIN)
-            self.line.request(**config)
+            self.line.request(consumer="door_sensor", type=gpiod.LINE_REQ_DIR_IN)
             
         except Exception as e:
             print(f"Error initializing GPIO: {e}")
