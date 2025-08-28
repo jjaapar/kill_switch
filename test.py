@@ -17,19 +17,18 @@ CHECK_INTERVAL = 0.5  # seconds
 class DoorSensor:
     def __init__(self):
         try:
+            # Open GPIO chip
             self.chip = gpiod.Chip(CHIP_NAME)
+            
+            # Request GPIO line with proper configuration
+            config = {
+                "consumer": "door_sensor",
+                "direction": gpiod.Line.Direction.INPUT,
+                "bias": gpiod.Line.Bias.PULL_UP if PULL_UP else gpiod.Line.Bias.PULL_DOWN
+            }
+            
             self.line = self.chip.get_line(GPIO_PIN)
-            
-            # Configure the GPIO line
-            config = gpiod.LineSettings()
-            config.set_direction(gpiod.LineSettings.Direction.INPUT)
-            
-            if PULL_UP:
-                config.set_bias(gpiod.LineSettings.Bias.PULL_UP)
-            else:
-                config.set_bias(gpiod.LineSettings.Bias.PULL_DOWN)
-            
-            self.line.set_config(config)
+            self.line.request(**config)
             
         except Exception as e:
             print(f"Error initializing GPIO: {e}")
@@ -58,6 +57,8 @@ class DoorSensor:
 def main():
     """Main function to monitor door state"""
     print("Door Sensor Monitoring Started (Press CTRL+C to exit)")
+    print(f"Using GPIO pin {GPIO_PIN} on {CHIP_NAME}")
+    print("Configuration: " + ("PULL UP" if PULL_UP else "PULL DOWN"))
     
     door_sensor = DoorSensor()
     last_state = None
