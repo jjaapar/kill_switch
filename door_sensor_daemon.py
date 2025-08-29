@@ -33,8 +33,8 @@ class DoorState:
         self.state_file = state_file
         self.current_state = {
             'door_open': False,
-            'last_change': datetime.now().isoformat(),
-            'last_alert': datetime.now().isoformat(),
+            'last_change': datetime.now().isoformat(),  # Store as ISO format string immediately
+            'last_alert': datetime.now().isoformat(),   # Store as ISO format string immediately
             'alert_sent': False
         }
         self.load_state()
@@ -44,19 +44,20 @@ class DoorState:
         try:
             with open(self.state_file, 'r') as f:
                 saved_state = json.load(f)
+                # No need to convert strings to datetime objects here
                 self.current_state.update(saved_state)
-                # Convert ISO format strings back to datetime
-                self.current_state['last_change'] = datetime.fromisoformat(self.current_state['last_change'])
-                self.current_state['last_alert'] = datetime.fromisoformat(self.current_state['last_alert'])
         except FileNotFoundError:
             self.save_state()
 
     def save_state(self):
         """Save current state to file"""
         state_to_save = self.current_state.copy()
-        # Convert datetime objects to ISO format strings for JSON serialization
-        state_to_save['last_change'] = state_to_save['last_change'].isoformat()
-        state_to_save['last_alert'] = state_to_save['last_alert'].isoformat()
+        
+        # If the timestamps are datetime objects, convert them to ISO format
+        if isinstance(state_to_save['last_change'], datetime):
+            state_to_save['last_change'] = state_to_save['last_change'].isoformat()
+        if isinstance(state_to_save['last_alert'], datetime):
+            state_to_save['last_alert'] = state_to_save['last_alert'].isoformat()
         
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         with open(self.state_file, 'w') as f:
@@ -66,11 +67,11 @@ class DoorState:
         """Update state with new values"""
         if self.current_state['door_open'] != door_open:
             self.current_state['door_open'] = door_open
-            self.current_state['last_change'] = datetime.now()
+            self.current_state['last_change'] = datetime.now().isoformat()  # Store as string
         
         if alert_sent is not None:
             self.current_state['alert_sent'] = alert_sent
-            self.current_state['last_alert'] = datetime.now()
+            self.current_state['last_alert'] = datetime.now().isoformat()  # Store as string
         
         self.save_state()
 
