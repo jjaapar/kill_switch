@@ -35,9 +35,10 @@ class DoorState:
         self.state_file = state_file
         self.current_state = {
             'door_open': False,
-            'last_change': datetime.now().isoformat(),  # Store as ISO format string immediately
-            'last_alert': datetime.now().isoformat(),   # Store as ISO format string immediately
-            'alert_sent': False
+            'last_change': datetime.now().isoformat(),
+            'last_alert': datetime.now().isoformat(),
+            'alert_sent': False,
+            'last_state': None  # Add tracking of last state
         }
         self.load_state()
 
@@ -46,7 +47,6 @@ class DoorState:
         try:
             with open(self.state_file, 'r') as f:
                 saved_state = json.load(f)
-                # No need to convert strings to datetime objects here
                 self.current_state.update(saved_state)
         except FileNotFoundError:
             self.save_state()
@@ -67,13 +67,14 @@ class DoorState:
 
     def update_state(self, door_open, alert_sent=None):
         """Update state with new values"""
+        self.current_state['last_state'] = self.current_state['door_open']
         if self.current_state['door_open'] != door_open:
             self.current_state['door_open'] = door_open
-            self.current_state['last_change'] = datetime.now().isoformat()  # Store as string
+            self.current_state['last_change'] = datetime.now().isoformat()
         
         if alert_sent is not None:
             self.current_state['alert_sent'] = alert_sent
-            self.current_state['last_alert'] = datetime.now().isoformat()  # Store as string
+            self.current_state['last_alert'] = datetime.now().isoformat()
         
         self.save_state()
 
@@ -253,14 +254,30 @@ class DoorSensorDaemon:
 
     def should_send_alert(self, current_open):
         """
-        Determine if an alert should be sent based on current and previous states
+        Improved alert decision logic with state transition tracking
         """
-        # Only send alert if state has changed AND we haven't already alerted for this state
-        return (current_open != self.state.current_state['door_open'] and 
-                not self.state.current_state['alert_sent'])
+        # Convert stored timestamp string to datetime
+        last_alert_time = datetime.fromisoformat(self.state.current_state['last_alert'])
+        min_alert_interval = timedelta(seconds=self.config['monitoring']['debounce_delay'])
+        
+        # Check if enough time has passed since last alert
+        if datetime.now() - last_alert_time < min_alert_interval:
+            return False
+
+        # Check if this is a new state change
+        if current_open != self.state.current_state['door_open']:
+            if self.state.current_state['last_state'] != current_open:
+                return True
+            return False
+        
+        # For open door, only alert if no alert was sent
+        if current_open and not self.state.current_state['alert_sent']:
+            return True
+            
+        return False
 
     def monitor(self):
-        """Main monitoring loop with state checking."""
+        """Modified monitoring loop with improved state handling"""
         if not self.check_single_instance():
             sys.exit(1)
 
@@ -271,20 +288,19 @@ class DoorSensorDaemon:
 
         # Initial state check
         current_open = self.is_door_open()
-        last_state = current_open
-        
+        if self.should_send_alert(current_open):
+            self.logger.info(f"Initial door state: {'OPEN' if current_open else 'CLOSED'}")
+            command = self.config['commands']['door_open' if current_open else 'door_closed']
+            if self.run_ssh_command(command):
+                self.state.update_state(current_open, alert_sent=True)
+
         try:
             while self.running:
                 current_open = self.is_door_open()
                 
-                # If state has changed, reset debounce timer
-                if current_open != last_state:
-                    self.last_change_time = datetime.now()
-                    self.state.update_state(current_open, alert_sent=False)
-                    last_state = current_open
-                
-                # Only send alert if debounce period is over and alert conditions are met
                 if self.is_debounce_period_over() and self.should_send_alert(current_open):
+                    self.last_change_time = datetime.now()
+
                     if current_open:
                         self.logger.warning("Door OPENED")
                         command = self.config['commands']['door_open']
@@ -294,6 +310,8 @@ class DoorSensorDaemon:
 
                     if self.run_ssh_command(command):
                         self.state.update_state(current_open, alert_sent=True)
+                    else:
+                        self.state.update_state(current_open, alert_sent=False)
 
                 self.check_health()
                 time.sleep(self.config['monitoring']['alert_delay'])
