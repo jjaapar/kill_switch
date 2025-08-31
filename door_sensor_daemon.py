@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Door Sensor Daemon - Simplified Python version
-A secure, robust door monitoring system for Raspberry Pi that triggers remote actions via SSH.
+Door Sensor Daemon
+Door monitoring system that triggers remote actions via SSH.
 """
 
 import json
@@ -25,15 +25,12 @@ except ImportError:
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-
 class ConfigurationError(Exception):
     """Configuration-related errors."""
     pass
 
 
 class DoorSensorDaemon:
-    """Simplified door sensor daemon with all original functionality."""
-    
     # Default paths
     CONFIG_FILE = "/etc/door_sensor/config.ini"
     STATE_FILE = "/var/lib/door_sensor/state.json"
