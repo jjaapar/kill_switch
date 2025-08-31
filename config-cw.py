@@ -16,6 +16,8 @@ door_open = echo "Door opened at $(date)" >> /tmp/door_alerts.log && curl -X POS
 door_closed = echo "Door closed at $(date)" >> /tmp/door_alerts.log && curl -X POST https://api.example.com/door/closed
 
 [monitoring]
+; seconds to wait before alerting for open door
+open_alert_delay = 10.0 
 alert_delay = 0.5
 debounce_delay = 1.0
 health_check_interval = 300
