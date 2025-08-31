@@ -1,6 +1,8 @@
 # kill_switch
 
-This set of scripts and config file is for use with the Closed Loop Seco-Larm SM-4601-LQ Magnetic Contact and Raspberry Pi to sense the door state (OPEN/CLOSE). These logs and alerts when the door state changes from OPEN -> CLOSE or CLOSE -> OPEN.
+This set of scripts and config file is for use with the Closed Loop Seco-Larm SM-4601-LQ Magnetic Contact and Raspberry Pi to sense the door state (OPEN/CLOSE). These logs and alerts when the door state changes from OPEN -> CLOSE or CLOSE -> OPEN. 
+
+In this case, it sends a command via ssh to a remote server to trigger a light tower (Patlite LA6-POE) to blink RED.
 
 ## Install required packages:
 
