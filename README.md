@@ -27,7 +27,7 @@ ssh-copy-id -i ~/.ssh/id_rsa.pub user@remote-server.com
 
 ## Make the script executable:
 ```
-chmod +x /home/pi/door_sensor_daemon.py
+chmod +x /home/user_name/door_sensor_daemon.py
 ```
 
 ## Create log directory and set permissions:
@@ -35,7 +35,8 @@ chmod +x /home/pi/door_sensor_daemon.py
 sudo mkdir -p /var/log
 sudo touch /var/log/door_sensor.log
 sudo chown user_name:user_name /var/log/door_sensor.log
-sudo mkdir -p /var/run
+sudo mkdir -p /var/run/door_sensor
+sudo chown user_name:user_name /var/run/door_sensor
 ```
 
 ## Install the systemd service:
