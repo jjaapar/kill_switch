@@ -35,7 +35,7 @@ class DoorSensorDaemon:
     CONFIG_FILE = "/etc/door_sensor/config.ini"
     STATE_FILE = "/var/lib/door_sensor/state.json"
     LOG_FILE = "/var/log/door_sensor.log"
-    PID_FILE = "/var/run/door_sensor.pid"
+    PID_FILE = "/var/run/door_sensor/door_sensor.pid"
 
     def __init__(self, config_file: str = None):
         """Initialize daemon with configuration."""
