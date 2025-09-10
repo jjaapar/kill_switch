@@ -142,6 +142,7 @@ class DoorSensorDaemon:
                 'timestamp': timestamp,
                 'message': json.dumps({
                     'timestamp': datetime.now().isoformat(),
+                    'device_id': self.config['device_id'],
                     'level': level,
                     'message': message,
                     'door_state': 'OPEN' if self.state['door_open'] else 'CLOSED',
