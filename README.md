@@ -4,6 +4,8 @@ This set of scripts and config file is for use with the Closed Loop Seco-Larm SM
 
 In this case, it sends a command via ssh to a remote server to trigger a light tower (Patlite LA6-POE) to blink RED.
 
+<img alt="flowchart.png" align="center" src="https://github.com/jjaapar/kill_switch/blob/main/flowchart.png" width=25% height=25%>
+
 ## Install required packages:
 
 sudo apt-get update
