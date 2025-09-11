@@ -24,11 +24,14 @@ key_path = ~/.ssh/door_sensor_key
 timeout = 10
 
 [commands]
-# Command to run on remote host when door opens
+# Command to run on remote host when door is open and in ACTIVE mode
 door_open = /usr/local/bin/send_alert "Door OPEN"
 
 # Command to run on remote host when door closes  
 door_closed = /usr/local/bin/send_alert "Door CLOSED"
+
+# Command to run on remote host when door is open and in MAINT mode  
+door_open_maint = /usr/local/bin/send_alert "Door CLOSED"
 
 [monitoring]
 # Delay between sensor checks in seconds (default: 0.5)
