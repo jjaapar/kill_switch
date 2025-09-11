@@ -261,18 +261,41 @@ class DoorSensorDaemon:
         cloudwatch_level = 'WARNING' if current_open else 'INFO'
         self._send_to_cloudwatch(f"[{timestamp_str}] Door {state_text}", cloudwatch_level)
         
-        if self.maintenance_mode:
-            maintenance_msg = f"MAINTENANCE MODE: Skipping alerts for door {state_text}"
-            self.logger.info(maintenance_msg)
-            self._send_to_cloudwatch(f"[{timestamp_str}] {maintenance_msg}", 'INFO')
-            print(f"[{timestamp_str}] Door {state_text} (MAINTENANCE MODE)")
-        else:
-            print(f"[{timestamp_str}] ALERT: Door {state_text}")
+        # Determine which SSH command to run based on state and maintenance mode
+        command = None
+        alert_type = "ALERT"
+        
+        if current_open:  # Door is open
+            if self.maintenance_mode:
+                # MAINT mode + door open = use maintenance command
+                command = self.config.get('cmd_open_maint')
+                alert_type = "MAINT ALERT"
+                print(f"[{timestamp_str}] {alert_type}: Door {state_text} (MAINTENANCE MODE)")
+            else:
+                # Active mode + door open = use normal open command
+                command = self.config['cmd_open']
+                alert_type = "ALERT"
+                print(f"[{timestamp_str}] {alert_type}: Door {state_text}")
+        else:  # Door is closed
+            if self.maintenance_mode:
+                # MAINT mode + door closed = skip SSH command
+                maintenance_msg = f"MAINTENANCE MODE: Door {state_text} - no action needed"
+                self.logger.info(maintenance_msg)
+                self._send_to_cloudwatch(f"[{timestamp_str}] {maintenance_msg}", 'INFO')
+                print(f"[{timestamp_str}] Door {state_text} (MAINTENANCE MODE)")
+            else:
+                # Active mode + door closed = use normal closed command
+                command = self.config['cmd_closed']
+                alert_type = "ALERT"
+                print(f"[{timestamp_str}] {alert_type}: Door {state_text}")
+        
+        # Execute SSH command if one was determined
+        if command:
             try:
-                command = self.config['cmd_open'] if current_open else self.config['cmd_closed']
                 if self._run_ssh_command(command):
                     self.state['last_alert'] = now.isoformat()
-                    self._send_to_cloudwatch(f"[{timestamp_str}] Alert sent for door {state_text}", 'INFO')
+                    cmd_type = "maintenance" if (current_open and self.maintenance_mode) else "normal"
+                    self._send_to_cloudwatch(f"[{timestamp_str}] {alert_type} sent for door {state_text} ({cmd_type} command)", 'INFO')
             except Exception as e:
                 error_msg = f"SSH command failed: {e}"
                 self.logger.error(error_msg)
