@@ -137,12 +137,14 @@ class DoorSensorDaemon:
             return
         
         try:
-            timestamp = int(datetime.now().timestamp() * 1000)
+            now = datetime.now()
+            timestamp = int(now.timestamp() * 1000)
             log_event = {
                 'timestamp': timestamp,
                 'message': json.dumps({
-                    'timestamp': datetime.now().isoformat(),
-                    'device_id': self.config['device_id'],
+                    'timestamp': now.isoformat(),
+                    'formatted_timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+                    'device_id': self.config.get('device_id', 'unknown'),
                     'level': level,
                     'message': message,
                     'door_state': 'OPEN' if self.state['door_open'] else 'CLOSED',
@@ -213,8 +215,9 @@ class DoorSensorDaemon:
                 if new_mode != self.maintenance_mode:
                     self.maintenance_mode = new_mode
                     mode = "MAINTENANCE" if new_mode else "ACTIVE"
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     self.logger.info(f"Mode changed to: {mode}")
-                    self._send_to_cloudwatch(f"Mode changed to: {mode}", 'INFO')
+                    self._send_to_cloudwatch(f"[{timestamp}] Mode changed to: {mode}", 'INFO')
             else:
                 self.maintenance_mode = False
         except Exception as e:
@@ -240,35 +243,40 @@ class DoorSensorDaemon:
             raise Exception("SSH command failed")
 
     def _handle_door_change(self, current_open):
+        now = datetime.now()
+        timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        
         self.state.update({
             'door_open': current_open,
-            'last_change': datetime.now().isoformat(),
+            'last_change': now.isoformat(),
             'initialized': True
         })
-        self.last_change_time = datetime.now()
+        self.last_change_time = now
         
         state_text = "OPEN" if current_open else "CLOSED"
         log_level = logging.WARNING if current_open else logging.INFO
         self.logger.log(log_level, f"Door {state_text}")
         
-        # Send state change to CloudWatch
+        # Send state change to CloudWatch with timestamp
         cloudwatch_level = 'WARNING' if current_open else 'INFO'
-        self._send_to_cloudwatch(f"Door {state_text}", cloudwatch_level)
+        self._send_to_cloudwatch(f"[{timestamp_str}] Door {state_text}", cloudwatch_level)
         
         if self.maintenance_mode:
-            self.logger.info(f"MAINTENANCE MODE: Skipping alerts for door {state_text}")
-            self._send_to_cloudwatch(f"MAINTENANCE MODE: Skipping alerts for door {state_text}", 'INFO')
-            print(f"Door {state_text} (MAINTENANCE MODE)")
+            maintenance_msg = f"MAINTENANCE MODE: Skipping alerts for door {state_text}"
+            self.logger.info(maintenance_msg)
+            self._send_to_cloudwatch(f"[{timestamp_str}] {maintenance_msg}", 'INFO')
+            print(f"[{timestamp_str}] Door {state_text} (MAINTENANCE MODE)")
         else:
-            print(f"ALERT: Door {state_text}")
+            print(f"[{timestamp_str}] ALERT: Door {state_text}")
             try:
                 command = self.config['cmd_open'] if current_open else self.config['cmd_closed']
                 if self._run_ssh_command(command):
-                    self.state['last_alert'] = datetime.now().isoformat()
-                    self._send_to_cloudwatch(f"Alert sent for door {state_text}", 'INFO')
+                    self.state['last_alert'] = now.isoformat()
+                    self._send_to_cloudwatch(f"[{timestamp_str}] Alert sent for door {state_text}", 'INFO')
             except Exception as e:
-                self.logger.error(f"SSH command failed: {e}")
-                self._send_to_cloudwatch(f"SSH command failed: {e}", 'ERROR')
+                error_msg = f"SSH command failed: {e}"
+                self.logger.error(error_msg)
+                self._send_to_cloudwatch(f"[{timestamp_str}] {error_msg}", 'ERROR')
         
         self._save_state()
 
@@ -292,8 +300,9 @@ class DoorSensorDaemon:
 
         try:
             self.running = True
+            start_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.logger.info("Starting door sensor monitoring")
-            self._send_to_cloudwatch("Starting door sensor monitoring", 'INFO')
+            self._send_to_cloudwatch(f"[{start_timestamp}] Starting door sensor monitoring", 'INFO')
             
             self._check_maintenance_mode()
             current_open = self._is_door_open()
@@ -301,8 +310,9 @@ class DoorSensorDaemon:
             # Handle initial state
             if not self.state['initialized']:
                 initial_state = 'OPEN' if current_open else 'CLOSED'
+                init_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 self.logger.info(f"Initial door state: {initial_state}")
-                self._send_to_cloudwatch(f"Initial door state: {initial_state}", 'INFO')
+                self._send_to_cloudwatch(f"[{init_timestamp}] Initial door state: {initial_state}", 'INFO')
                 if current_open:
                     self._handle_door_change(current_open)
                 else:
@@ -337,7 +347,10 @@ class DoorSensorDaemon:
                 GPIO.cleanup()
             self._save_state()
             Path("/var/run/door_sensor.pid").unlink(missing_ok=True)
+            shutdown_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.logger.info("Shutdown complete")
+            if self.cloudwatch_client:
+                self._send_to_cloudwatch(f"[{shutdown_timestamp}] Shutdown complete", 'INFO')
 
 
 def main():
