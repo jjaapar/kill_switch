@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Door Sensor Daemon - Simplified with CloudWatch Logging"""
+"""
+Door Monitor - Watches a door and sends alerts when it opens/closes
+
+This script monitors a door sensor and runs commands when the door state changes.
+It supports both normal operation and maintenance mode with different commands.
+"""
 
 import json
 import logging
@@ -13,10 +18,12 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# Import optional dependencies
 try:
     import RPi.GPIO as GPIO
 except ImportError:
     GPIO = None
+    print("Warning: RPi.GPIO not available - running in test mode")
 
 try:
     import boto3
@@ -27,376 +34,418 @@ except ImportError:
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
-def load_config(config_file="/etc/door_sensor/config.ini"):
-    """Load configuration from file"""
-    if not Path(config_file).exists():
-        raise Exception(f"Config file not found: {config_file}")
+def read_config_file(config_path="/etc/door_sensor/config.ini"):
+    """Read the configuration file and return settings"""
+    if not Path(config_path).exists():
+        print(f"Error: Can't find config file at {config_path}")
+        sys.exit(1)
     
     config = ConfigParser()
-    config.read(config_file)
+    config.read(config_path)
     
-    # Set defaults and read all at once
-    defaults = {
-        'gpio_pin': 17, 'gpio_pull_up': True, 'ssh_port': 22, 'ssh_timeout': 10,
-        'alert_delay': 0.5, 'debounce_delay': 1.0, 'cloudwatch_enabled': False,
-        'cloudwatch_log_group': 'door-sensor', 'cloudwatch_log_stream': 'door-events',
-        'cloudwatch_region': 'us-east-1'
+    # Get the settings we need with sensible defaults
+    settings = {
+        # GPIO settings
+        'door_pin': config.getint('gpio', 'sensor_pin', fallback=17),
+        'use_pullup': config.getboolean('gpio', 'pull_up', fallback=True),
+        
+        # SSH connection
+        'server': config.get('ssh', 'host'),
+        'ssh_port': config.getint('ssh', 'port', fallback=22),
+        'key_file': os.path.expanduser(config.get('ssh', 'key_path')),
+        'timeout': config.getint('ssh', 'timeout', fallback=10),
+        
+        # Commands to run
+        'door_open_cmd': config.get('commands', 'door_open'),
+        'door_closed_cmd': config.get('commands', 'door_closed'),
+        'maintenance_open_cmd': config.get('commands', 'door_open_maint', fallback=None),
+        
+        # Timing
+        'check_every': config.getfloat('monitoring', 'alert_delay', fallback=0.5),
+        'ignore_bounces_for': config.getfloat('monitoring', 'debounce_delay', fallback=1.0),
+        
+        # CloudWatch (optional)
+        'use_cloudwatch': config.getboolean('cloudwatch', 'enabled', fallback=False),
+        'log_group': config.get('cloudwatch', 'log_group', fallback='door-sensor'),
+        'log_stream': config.get('cloudwatch', 'log_stream', fallback='door-events'),
+        'aws_region': config.get('cloudwatch', 'region', fallback='us-east-1')
     }
     
-    result = {}
-    for key, default in defaults.items():
-        section, option = key.split('_', 1) if '_' in key else ('DEFAULT', key)
-        if section == 'cloudwatch':
-            section = 'cloudwatch'
-        elif section in ['gpio', 'ssh', 'alert', 'debounce']:
-            section = section
-        else:
-            section = 'monitoring'
-        
-        if isinstance(default, bool):
-            result[key] = config.getboolean(section, option, fallback=default)
-        elif isinstance(default, int):
-            result[key] = config.getint(section, option, fallback=default)
-        elif isinstance(default, float):
-            result[key] = config.getfloat(section, option, fallback=default)
-        else:
-            result[key] = config.get(section, option, fallback=default)
-    
-    # Required string configs
-    for key in ['ssh_host', 'ssh_key', 'cmd_open', 'cmd_closed']:
-        section = 'ssh' if key.startswith('ssh_') else 'commands'
-        result[key] = config.get(section, key.replace('ssh_', '').replace('cmd_', ''))
-    
-    result['ssh_key'] = os.path.expanduser(result['ssh_key'])
-    result['cmd_open_maint'] = config.get('commands', 'door_open_maint', fallback=None)
-    
-    return result
+    return settings
 
 
-def setup_logging():
-    """Setup logging configuration"""
+def setup_file_logging():
+    """Create a logger that writes to both file and console"""
     Path("/var/log").mkdir(exist_ok=True)
-    logger = logging.getLogger('DoorSensor')
+    
+    logger = logging.getLogger('DoorMonitor')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
-    handler = RotatingFileHandler("/var/log/door_sensor.log", maxBytes=1024*1024, backupCount=5)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler())
+    # Log to file with rotation
+    file_handler = RotatingFileHandler("/var/log/door_sensor.log", 
+                                      maxBytes=1024*1024, backupCount=5)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # Also log to console
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logger.addHandler(console_handler)
+    
     return logger
 
 
-def setup_cloudwatch(config, logger):
-    """Initialize CloudWatch client"""
-    if not config['cloudwatch_enabled'] or not boto3:
+def connect_to_cloudwatch(settings, logger):
+    """Try to connect to AWS CloudWatch for logging"""
+    if not settings['use_cloudwatch'] or not boto3:
         return None
     
     try:
-        client = boto3.client('logs', region_name=config['cloudwatch_region'])
+        # Connect to AWS
+        client = boto3.client('logs', region_name=settings['aws_region'])
         
-        # Ensure resources exist
-        for resource_type, name in [('log_group', config['cloudwatch_log_group']), 
-                                   ('log_stream', config['cloudwatch_log_stream'])]:
-            try:
-                if resource_type == 'log_group':
-                    client.create_log_group(logGroupName=name)
-                else:
-                    client.create_log_stream(logGroupName=config['cloudwatch_log_group'], 
-                                           logStreamName=name)
-            except ClientError as e:
-                if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
-                    raise
+        # Make sure our log group exists
+        try:
+            client.create_log_group(logGroupName=settings['log_group'])
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
+                raise
         
-        logger.info("CloudWatch logging initialized")
+        # Make sure our log stream exists  
+        try:
+            client.create_log_stream(logGroupName=settings['log_group'],
+                                   logStreamName=settings['log_stream'])
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
+                raise
+        
+        logger.info("Connected to CloudWatch for logging")
         return client
+    
     except Exception as e:
-        logger.warning(f"CloudWatch initialization failed: {e}")
+        logger.warning(f"Couldn't connect to CloudWatch: {e}")
         return None
 
 
-def log_to_cloudwatch(cloudwatch, config, message, level, door_open, maintenance_mode, logger):
-    """Send message to CloudWatch"""
+def send_to_cloudwatch(cloudwatch, settings, message, level, door_is_open, in_maintenance, logger):
+    """Send a message to CloudWatch if it's available"""
     if not cloudwatch:
         return
     
     try:
         now = datetime.now()
-        log_event = {
+        
+        # Create the log entry
+        log_entry = {
             'timestamp': int(now.timestamp() * 1000),
             'message': json.dumps({
-                'timestamp': now.isoformat(),
-                'formatted_timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-                'device_id': config.get('device_id', 'unknown'),
+                'when': now.isoformat(),
+                'readable_time': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'level': level,
                 'message': message,
-                'door_state': 'OPEN' if door_open else 'CLOSED',
-                'maintenance_mode': maintenance_mode
+                'door_state': 'OPEN' if door_is_open else 'CLOSED',
+                'maintenance_mode': in_maintenance
             })
         }
         
-        # Get sequence token if available
-        sequence_token = None
-        try:
-            response = cloudwatch.describe_log_streams(
-                logGroupName=config['cloudwatch_log_group'],
-                logStreamNamePrefix=config['cloudwatch_log_stream']
-            )
-            for stream in response.get('logStreams', []):
-                if stream['logStreamName'] == config['cloudwatch_log_stream']:
-                    sequence_token = stream.get('uploadSequenceToken')
-                    break
-        except ClientError:
-            pass
-        
-        # Send log event
-        kwargs = {
-            'logGroupName': config['cloudwatch_log_group'],
-            'logStreamName': config['cloudwatch_log_stream'],
-            'logEvents': [log_event]
-        }
-        if sequence_token:
-            kwargs['sequenceToken'] = sequence_token
-            
-        cloudwatch.put_log_events(**kwargs)
+        # Send it to CloudWatch
+        cloudwatch.put_log_events(
+            logGroupName=settings['log_group'],
+            logStreamName=settings['log_stream'],
+            logEvents=[log_entry]
+        )
         
     except Exception as e:
-        logger.warning(f"CloudWatch logging failed: {e}")
+        logger.warning(f"Failed to send to CloudWatch: {e}")
 
 
-def setup_gpio(config, logger):
-    """Setup GPIO pins"""
+def setup_door_sensor(settings, logger):
+    """Setup the GPIO pin for the door sensor"""
     if not GPIO:
-        logger.warning("RPi.GPIO not available - test mode")
+        logger.warning("GPIO not available - running in test mode")
         return None
     
     GPIO.setmode(GPIO.BCM)
-    GPIO.setup(config['gpio_pin'], GPIO.IN, 
-              pull_up_down=GPIO.PUD_UP if config['gpio_pull_up'] else GPIO.PUD_DOWN)
     
-    closed_state = GPIO.LOW if config['gpio_pull_up'] else GPIO.HIGH
-    return closed_state
+    if settings['use_pullup']:
+        GPIO.setup(settings['door_pin'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        door_closed_value = GPIO.LOW
+    else:
+        GPIO.setup(settings['door_pin'], GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  
+        door_closed_value = GPIO.HIGH
+    
+    logger.info(f"Door sensor setup on GPIO pin {settings['door_pin']}")
+    return door_closed_value
 
 
-def load_state():
-    """Load persistent state from file"""
-    state = {'door_open': False, 'last_change': datetime.now().isoformat(), 
-             'last_alert': None, 'initialized': False}
+def remember_door_state():
+    """Load the last known door state from disk"""
+    memory = {
+        'door_is_open': False,
+        'last_changed': datetime.now().isoformat(),
+        'last_alert_sent': None,
+        'been_initialized': False
+    }
     
     try:
-        state_file = Path("/var/lib/door_sensor/state.json")
-        if state_file.exists():
-            state.update(json.loads(state_file.read_text()))
-            state['initialized'] = True
+        memory_file = Path("/var/lib/door_sensor/state.json")
+        if memory_file.exists():
+            saved_memory = json.loads(memory_file.read_text())
+            memory.update(saved_memory)
+            memory['been_initialized'] = True
     except Exception as e:
-        logging.warning(f"Could not load state: {e}")
+        logging.warning(f"Couldn't load saved state: {e}")
     
-    return state
+    return memory
 
 
-def save_state(state):
-    """Save persistent state to file"""
+def save_door_state(memory):
+    """Save the current door state to disk"""
     try:
-        state_file = Path("/var/lib/door_sensor/state.json")
-        state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-        state_file.write_text(json.dumps(state, indent=2))
+        memory_file = Path("/var/lib/door_sensor/state.json")
+        memory_file.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        memory_file.write_text(json.dumps(memory, indent=2))
     except Exception as e:
-        logging.error(f"Could not save state: {e}")
+        logging.error(f"Couldn't save state: {e}")
 
 
-def check_maintenance_mode():
-    """Check if maintenance mode is enabled"""
+def check_if_maintenance_mode():
+    """See if we're in maintenance mode by checking a simple file"""
     try:
-        return Path("/tmp/state").read_text().strip().upper() == "MAINT"
+        mode_file = Path("/tmp/state")
+        if mode_file.exists():
+            content = mode_file.read_text().strip().upper()
+            return content == "MAINT"
     except:
-        return False
+        pass
+    return False
 
 
-def is_door_open(config, closed_state):
-    """Check if door is currently open"""
-    return GPIO and GPIO.input(config['gpio_pin']) != closed_state
+def read_door_sensor(settings, door_closed_value):
+    """Check if the door is currently open"""
+    if not GPIO:
+        return False  # Test mode - assume door is closed
+    
+    current_value = GPIO.input(settings['door_pin'])
+    return current_value != door_closed_value
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def run_ssh_command(config, command, logger):
-    """Execute SSH command with retry logic"""
+def run_remote_command(settings, command, logger):
+    """Run a command on the remote server via SSH"""
     if not command:
         return True
-        
-    cmd = ["ssh", "-i", config['ssh_key'], "-p", str(config['ssh_port']),
-           "-o", f"ConnectTimeout={config['ssh_timeout']}", "-o", "BatchMode=yes",
-           config['ssh_host'], command]
     
-    result = subprocess.run(cmd, capture_output=True, text=True, 
-                          timeout=config['ssh_timeout'] + 5)
+    # Build the SSH command
+    ssh_cmd = [
+        "ssh", 
+        "-i", settings['key_file'],
+        "-p", str(settings['ssh_port']),
+        "-o", f"ConnectTimeout={settings['timeout']}",
+        "-o", "BatchMode=yes",
+        settings['server'],
+        command
+    ]
+    
+    # Run it
+    result = subprocess.run(ssh_cmd, capture_output=True, text=True, 
+                          timeout=settings['timeout'] + 5)
     
     if result.returncode == 0:
-        logger.info("SSH command executed successfully")
+        logger.info(f"Successfully ran remote command")
         return True
     else:
-        logger.error(f"SSH command failed: {result.stderr}")
-        raise Exception(f"SSH command failed: {result.stderr}")
+        error_msg = f"Remote command failed: {result.stderr}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
 
 
-def handle_door_change(config, state, current_open, maintenance_mode, cloudwatch, logger):
-    """Handle door state change"""
-    now = datetime.now()
-    timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
+def handle_door_change(settings, memory, door_is_open, in_maintenance, cloudwatch, logger):
+    """Deal with the door changing state (opening or closing)"""
+    right_now = datetime.now()
+    time_stamp = right_now.strftime('%Y-%m-%d %H:%M:%S')
     
-    # Update state
-    state.update({
-        'door_open': current_open,
-        'last_change': now.isoformat(),
-        'initialized': True
+    # Update our memory
+    memory.update({
+        'door_is_open': door_is_open,
+        'last_changed': right_now.isoformat(),
+        'been_initialized': True
     })
     
-    state_text = "OPEN" if current_open else "CLOSED"
-    log_level = logging.WARNING if current_open else logging.INFO
-    logger.log(log_level, f"Door {state_text}")
+    # Figure out what happened
+    what_happened = "OPENED" if door_is_open else "CLOSED"
     
-    # Determine command and alert type
-    command = None
+    # Log it appropriately (opening is more serious than closing)
+    if door_is_open:
+        logger.warning(f"Door {what_happened}")
+    else:
+        logger.info(f"Door {what_happened}")
+    
+    # Figure out what command to run and what kind of alert to send
+    command_to_run = None
     alert_type = "ALERT"
     
-    if current_open:  # Door open
-        if maintenance_mode and config['cmd_open_maint']:
-            command = config['cmd_open_maint']
-            alert_type = "MAINT ALERT"
+    if door_is_open:
+        if in_maintenance and settings['maintenance_open_cmd']:
+            command_to_run = settings['maintenance_open_cmd']
+            alert_type = "MAINTENANCE ALERT"
         else:
-            command = config['cmd_open']
-    elif not maintenance_mode:  # Door closed, not in maintenance
-        command = config['cmd_closed']
+            command_to_run = settings['door_open_cmd']
+    elif not in_maintenance:
+        # Door closed and we're not in maintenance mode
+        command_to_run = settings['door_closed_cmd']
     
-    # Print alert
-    mode_suffix = " (MAINTENANCE MODE)" if maintenance_mode else ""
-    print(f"[{timestamp_str}] {alert_type}: Door {state_text}{mode_suffix}")
+    # Show the alert
+    mode_note = " (MAINTENANCE MODE)" if in_maintenance else ""
+    print(f"[{time_stamp}] {alert_type}: Door {what_happened}{mode_note}")
     
     # Log to CloudWatch
-    cloudwatch_level = 'WARNING' if current_open else 'INFO'
-    log_to_cloudwatch(cloudwatch, config, f"[{timestamp_str}] Door {state_text}{mode_suffix}", 
-                     cloudwatch_level, current_open, maintenance_mode, logger)
+    log_level = 'WARNING' if door_is_open else 'INFO'
+    send_to_cloudwatch(cloudwatch, settings, f"[{time_stamp}] Door {what_happened}{mode_note}",
+                      log_level, door_is_open, in_maintenance, logger)
     
-    # Execute SSH command
-    if command:
+    # Run the appropriate command if we have one
+    if command_to_run:
         try:
-            if run_ssh_command(config, command, logger):
-                state['last_alert'] = now.isoformat()
-                cmd_type = "maintenance" if (current_open and maintenance_mode) else "normal"
-                log_to_cloudwatch(cloudwatch, config, 
-                                f"[{timestamp_str}] {alert_type} sent for door {state_text} ({cmd_type} command)", 
-                                'INFO', current_open, maintenance_mode, logger)
+            if run_remote_command(settings, command_to_run, logger):
+                memory['last_alert_sent'] = right_now.isoformat()
+                command_type = "maintenance" if (door_is_open and in_maintenance) else "normal"
+                send_to_cloudwatch(cloudwatch, settings,
+                                 f"[{time_stamp}] {alert_type} sent for door {what_happened} ({command_type} command)",
+                                 'INFO', door_is_open, in_maintenance, logger)
         except Exception as e:
-            error_msg = f"SSH command failed: {e}"
+            error_msg = f"Failed to run remote command: {e}"
             logger.error(error_msg)
-            log_to_cloudwatch(cloudwatch, config, f"[{timestamp_str}] {error_msg}", 
-                            'ERROR', current_open, maintenance_mode, logger)
+            send_to_cloudwatch(cloudwatch, settings, f"[{time_stamp}] {error_msg}",
+                             'ERROR', door_is_open, in_maintenance, logger)
     
-    save_state(state)
-    return now
+    # Save our current state
+    save_door_state(memory)
+    return right_now
 
 
-def ensure_single_instance(logger):
-    """Ensure only one instance runs"""
-    pid_file = Path("/var/run/door_sensor.pid")
-    if pid_file.exists():
+def make_sure_only_one_copy_running(logger):
+    """Prevent multiple copies of this script from running at the same time"""
+    lock_file = Path("/var/run/door_sensor.pid")
+    
+    if lock_file.exists():
         try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
-            logger.error(f"Already running (PID: {pid})")
+            existing_pid = int(lock_file.read_text().strip())
+            os.kill(existing_pid, 0)  # Check if that process still exists
+            logger.error(f"Another copy is already running (PID: {existing_pid})")
             return False
         except (ValueError, OSError):
-            pid_file.unlink(missing_ok=True)
+            # The old process is gone, clean up the stale lock file
+            lock_file.unlink(missing_ok=True)
     
-    pid_file.write_text(str(os.getpid()))
+    # Create our lock file
+    lock_file.write_text(str(os.getpid()))
     return True
 
 
-def monitor():
-    """Main monitoring function"""
-    # Initialize components
-    config = load_config()
-    logger = setup_logging()
-    cloudwatch = setup_cloudwatch(config, logger)
-    closed_state = setup_gpio(config, logger)
-    state = load_state()
+def watch_the_door():
+    """Main function - this does all the work"""
+    # Get everything set up
+    settings = read_config_file()
+    logger = setup_file_logging()
+    cloudwatch = connect_to_cloudwatch(settings, logger)
+    door_closed_value = setup_door_sensor(settings, logger)
+    memory = remember_door_state()
     
-    if not ensure_single_instance(logger):
+    # Make sure we're the only copy running
+    if not make_sure_only_one_copy_running(logger):
         sys.exit(1)
-
-    # Setup signal handlers
-    running = [True]  # Use list to allow modification in nested function
-    def signal_handler(signum, frame):
-        running[0] = False
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
+    # Set up signal handlers so we can shut down cleanly
+    keep_running = [True]  # Use a list so we can modify it from inside the function
+    
+    def shutdown_gracefully(signal_num, frame):
+        print("\nShutting down...")
+        keep_running[0] = False
+    
+    signal.signal(signal.SIGINT, shutdown_gracefully)   # Ctrl+C
+    signal.signal(signal.SIGTERM, shutdown_gracefully)  # Kill command
+    
     try:
-        start_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        logger.info("Starting door sensor monitoring")
-        log_to_cloudwatch(cloudwatch, config, f"[{start_timestamp}] Starting door sensor monitoring", 
-                         'INFO', state['door_open'], False, logger)
+        # Start up
+        start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        logger.info("Door monitor starting up")
+        send_to_cloudwatch(cloudwatch, settings, f"[{start_time}] Door monitor starting up",
+                          'INFO', memory['door_is_open'], False, logger)
         
-        # Initialize
-        maintenance_mode = check_maintenance_mode()
-        current_open = is_door_open(config, closed_state)
+        # Check current state
+        in_maintenance = check_if_maintenance_mode()
+        door_is_open = read_door_sensor(settings, door_closed_value)
         last_change_time = datetime.now()
         
-        if not state['initialized']:
-            initial_state = 'OPEN' if current_open else 'CLOSED'
-            init_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            logger.info(f"Initial door state: {initial_state}")
-            log_to_cloudwatch(cloudwatch, config, f"[{init_timestamp}] Initial door state: {initial_state}", 
-                            'INFO', current_open, maintenance_mode, logger)
+        # Handle initial state if this is our first time running
+        if not memory['been_initialized']:
+            initial_state = 'OPEN' if door_is_open else 'CLOSED'
+            init_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            logger.info(f"Starting up - door is {initial_state}")
+            send_to_cloudwatch(cloudwatch, settings, f"[{init_time}] Starting up - door is {initial_state}",
+                             'INFO', door_is_open, in_maintenance, logger)
             
-            if current_open:
-                last_change_time = handle_door_change(config, state, current_open, 
-                                                    maintenance_mode, cloudwatch, logger)
+            if door_is_open:
+                # Door is open on startup - treat this as a change
+                last_change_time = handle_door_change(settings, memory, door_is_open,
+                                                    in_maintenance, cloudwatch, logger)
             else:
-                state.update({'door_open': current_open, 'initialized': True})
-                save_state(state)
-
+                # Door is closed on startup - just remember this state
+                memory.update({'door_is_open': door_is_open, 'been_initialized': True})
+                save_door_state(memory)
+        
         last_maintenance_check = datetime.now()
         
-        # Main monitoring loop
-        while running[0]:
-            # Check maintenance mode every 30 seconds
+        print(f"Monitoring door sensor on GPIO pin {settings['door_pin']}")
+        print("Press Ctrl+C to stop")
+        
+        # Main loop - keep watching the door
+        while keep_running[0]:
+            # Check if we've switched maintenance mode (every 30 seconds)
             if datetime.now() - last_maintenance_check > timedelta(seconds=30):
-                maintenance_mode = check_maintenance_mode()
+                in_maintenance = check_if_maintenance_mode()
                 last_maintenance_check = datetime.now()
             
-            current_open = is_door_open(config, closed_state)
+            # Check the door
+            door_is_open = read_door_sensor(settings, door_closed_value)
             
-            # Handle state change after debounce
-            if (state['door_open'] != current_open and 
-                datetime.now() - last_change_time > timedelta(seconds=config['debounce_delay'])):
-                last_change_time = handle_door_change(config, state, current_open, 
-                                                    maintenance_mode, cloudwatch, logger)
+            # Has the door state changed?
+            door_state_changed = memory['door_is_open'] != door_is_open
+            enough_time_passed = datetime.now() - last_change_time > timedelta(seconds=settings['ignore_bounces_for'])
             
-            time.sleep(config['alert_delay'])
-
+            if door_state_changed and enough_time_passed:
+                last_change_time = handle_door_change(settings, memory, door_is_open,
+                                                    in_maintenance, cloudwatch, logger)
+            
+            # Wait a bit before checking again
+            time.sleep(settings['check_every'])
+    
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
+        logger.info("Got keyboard interrupt")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Unexpected error: {e}")
         raise
     finally:
+        # Clean up
         if GPIO:
             GPIO.cleanup()
-        save_state(state)
+        save_door_state(memory)
         Path("/var/run/door_sensor.pid").unlink(missing_ok=True)
         
-        shutdown_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        logger.info("Shutdown complete")
-        log_to_cloudwatch(cloudwatch, config, f"[{shutdown_timestamp}] Shutdown complete", 
-                         'INFO', state.get('door_open', False), check_maintenance_mode(), logger)
+        shutdown_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        logger.info("Door monitor shut down")
+        send_to_cloudwatch(cloudwatch, settings, f"[{shutdown_time}] Door monitor shut down",
+                          'INFO', memory.get('door_is_open', False), check_if_maintenance_mode(), logger)
 
 
 def main():
-    """Main entry point"""
+    """Entry point when script is run directly"""
     try:
-        monitor()
+        watch_the_door()
     except Exception as e:
+        print(f"Fatal error: {e}")
         logging.error(f"Fatal error: {e}")
         sys.exit(1)
 
