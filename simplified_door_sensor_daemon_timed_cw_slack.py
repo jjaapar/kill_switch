@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Door Monitor - Watches a door and sends alerts when it opens/closes
-Supports SSH commands, CloudWatch logging, and Slack notifications
+Supports SSH commands and CloudWatch logging
 """
 
 import json
@@ -11,7 +11,6 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
 from configparser import ConfigParser
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -75,19 +74,7 @@ class DoorMonitor:
             'log_group': config.get('cloudwatch', 'log_group', fallback='door-sensor'),
             'log_stream': config.get('cloudwatch', 'log_stream', fallback='door-events'),
             'aws_region': config.get('cloudwatch', 'region', fallback='us-east-1'),
-            
-            # Slack
-            'use_slack': config.getboolean('slack', 'enabled', fallback=False),
-            'slack_webhook_url': config.get('slack', 'webhook_url', fallback=None),
-            'slack_channel': config.get('slack', 'channel', fallback='#alerts'),
-            'slack_username': config.get('slack', 'username', fallback='Door Monitor'),
-            'slack_icon': config.get('slack', 'icon_emoji', fallback=':door:'),
-            'slack_notify_open': config.getboolean('slack', 'notify_door_open', fallback=True),
-            'slack_notify_closed': config.getboolean('slack', 'notify_door_closed', fallback=False),
-            'slack_notify_startup': config.getboolean('slack', 'notify_startup', fallback=True),
-            'slack_notify_shutdown': config.getboolean('slack', 'notify_shutdown', fallback=False),
-            'slack_notify_maintenance': config.getboolean('slack', 'notify_maintenance_mode', fallback=True),
-            'slack_timeout': config.getint('slack', 'timeout', fallback=10)
+            'door_location': config.get('cloudwatch', 'door_location', fallback='FrontDoor')
         }
     
     def setup_logging(self):
@@ -199,43 +186,28 @@ class DoorMonitor:
             return False  # Test mode
         return GPIO.input(self.settings['door_pin']) != self.door_closed_value
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
-    def send_slack(self, message, color="good"):
-        """Send Slack notification"""
-        if not self.settings['use_slack'] or not self.settings['slack_webhook_url']:
-            return
-            
-        payload = {
-            "channel": self.settings['slack_channel'],
-            "username": self.settings['slack_username'], 
-            "icon_emoji": self.settings['slack_icon'],
-            "attachments": [{"color": color, "text": message, "ts": int(datetime.now().timestamp())}]
-        }
-        
-        request = urllib.request.Request(
-            self.settings['slack_webhook_url'],
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Content-Type': 'application/json'}
-        )
-        
-        with urllib.request.urlopen(request, timeout=self.settings['slack_timeout']) as response:
-            if response.getcode() != 200:
-                raise Exception(f"Slack returned {response.getcode()}")
-    
-    def log_to_cloudwatch(self, message, level, door_open, maintenance):
-        """Send message to CloudWatch"""
+    def send_to_cloudwatch(self, door_state):
+        """Send door state to CloudWatch logs"""
         if not self.cloudwatch:
             return
             
         try:
+            timestamp = datetime.utcnow()
+            metric_value = 1 if door_state == "OPEN" else 0
+            
             log_entry = {
-                'timestamp': int(datetime.now().timestamp() * 1000),
+                'timestamp': int(timestamp.timestamp() * 1000),
                 'message': json.dumps({
-                    'when': datetime.now().isoformat(),
-                    'level': level,
-                    'message': message,
-                    'door_state': 'OPEN' if door_open else 'CLOSED',
-                    'maintenance_mode': maintenance
+                    'MetricName': 'DoorState',
+                    'Dimensions': [
+                        {
+                            'Name': 'Location',
+                            'Value': self.settings['door_location']
+                        }
+                    ],
+                    'Value': metric_value,
+                    'Unit': 'None',
+                    'Timestamp': timestamp.isoformat()
                 })
             }
             
@@ -244,6 +216,7 @@ class DoorMonitor:
                 logStreamName=self.settings['log_stream'],
                 logEvents=[log_entry]
             )
+            self.logger.debug(f"Sent CloudWatch log: DoorState={metric_value}")
         except Exception as e:
             self.logger.warning(f"CloudWatch logging failed: {e}")
     
@@ -272,7 +245,7 @@ class DoorMonitor:
         """Handle door state change"""
         timestamp = datetime.now()
         time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        state = "OPENED" if door_open else "CLOSED"
+        state = "OPEN" if door_open else "CLOSE"
         
         # Update memory
         self.memory.update({
@@ -287,29 +260,22 @@ class DoorMonitor:
         message = f"Door {state}{maintenance_note}"
         log_method(message)
         
-        # Determine command and alert type
+        # Determine command
         command = None
-        alert_type = "ALERT"
-        
         if door_open:
             if maintenance_mode and self.settings['maintenance_open_cmd']:
                 command = self.settings['maintenance_open_cmd']
-                alert_type = "MAINTENANCE ALERT"
             else:
                 command = self.settings['door_open_cmd']
         elif not maintenance_mode:
             command = self.settings['door_closed_cmd']
         
         # Console output
-        console_msg = f"[{time_str}] {alert_type}: Door {state}{maintenance_note}"
+        console_msg = f"[{time_str}] Door {state}{maintenance_note}"
         print(console_msg)
         
-        # Slack notification
-        self.send_door_slack_notification(door_open, maintenance_mode, state)
-        
-        # CloudWatch logging
-        log_level = 'WARNING' if door_open else 'INFO'
-        self.log_to_cloudwatch(console_msg, log_level, door_open, maintenance_mode)
+        # CloudWatch logging - simple format
+        self.send_to_cloudwatch(state)
         
         # Execute SSH command
         if command:
@@ -317,43 +283,13 @@ class DoorMonitor:
                 if self.run_ssh_command(command):
                     self.memory['last_alert_sent'] = timestamp.isoformat()
                     success_msg = f"Command executed for door {state.lower()}"
-                    self.log_to_cloudwatch(success_msg, 'INFO', door_open, maintenance_mode)
+                    self.logger.info(success_msg)
             except Exception as e:
                 error_msg = f"SSH command failed: {e}"
                 self.logger.error(error_msg)
-                self.log_to_cloudwatch(error_msg, 'ERROR', door_open, maintenance_mode)
-                
-                # Slack error notification
-                try:
-                    slack_msg = f"❌ Failed to execute command for door {state.lower()}: {e}"
-                    self.send_slack(slack_msg, "danger")
-                except:
-                    pass
         
         self.save_state()
         return timestamp
-    
-    def send_door_slack_notification(self, door_open, maintenance_mode, state):
-        """Send appropriate Slack notification for door state change"""
-        should_notify = self.settings['slack_notify_open'] if door_open else self.settings['slack_notify_closed']
-        
-        if not should_notify:
-            return
-            
-        if door_open:
-            color = "warning" if not maintenance_mode else "danger"
-            if maintenance_mode and self.settings['slack_notify_maintenance']:
-                message = f"🔧 Maintenance Alert: Door {state.lower()}"
-            else:
-                message = f"🚪 Door {state.lower()}"
-        else:
-            color = "good"
-            message = f"🚪 Door {state.lower()}"
-        
-        try:
-            self.send_slack(message, color)
-        except Exception as e:
-            self.logger.warning(f"Slack notification failed: {e}")
     
     def ensure_single_instance(self):
         """Ensure only one instance is running"""
@@ -395,14 +331,6 @@ class DoorMonitor:
             # Startup
             start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.logger.info("Door monitor starting")
-            self.log_to_cloudwatch(f"Door monitor started at {start_time}", 'INFO', 
-                                  self.memory['door_is_open'], False)
-            
-            if self.settings['slack_notify_startup']:
-                try:
-                    self.send_slack(f"🟢 Door Monitor started at {start_time}", "good")
-                except Exception as e:
-                    self.logger.warning(f"Startup Slack notification failed: {e}")
             
             # Initialize state
             maintenance_mode = self.is_maintenance_mode()
@@ -412,7 +340,6 @@ class DoorMonitor:
             if not self.memory['initialized']:
                 state_msg = f"Starting up - door is {'OPEN' if door_open else 'CLOSED'}"
                 self.logger.info(state_msg)
-                self.log_to_cloudwatch(state_msg, 'INFO', door_open, maintenance_mode)
                 
                 if door_open:
                     last_change_time = self.handle_door_change(door_open, maintenance_mode)
@@ -450,7 +377,7 @@ class DoorMonitor:
             self.cleanup()
     
     def cleanup(self):
-        """Cleanup resources and send shutdown notifications"""
+        """Cleanup resources"""
         if GPIO:
             GPIO.cleanup()
         
@@ -463,14 +390,6 @@ class DoorMonitor:
         
         shutdown_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.logger.info("Door monitor shut down")
-        self.log_to_cloudwatch(f"Door monitor shut down at {shutdown_time}", 'INFO',
-                              self.memory.get('door_is_open', False), self.is_maintenance_mode())
-        
-        if self.settings['slack_notify_shutdown']:
-            try:
-                self.send_slack(f"🔴 Door Monitor shut down at {shutdown_time}", "warning")
-            except Exception as e:
-                self.logger.warning(f"Shutdown Slack notification failed: {e}")
 
 
 def main():
