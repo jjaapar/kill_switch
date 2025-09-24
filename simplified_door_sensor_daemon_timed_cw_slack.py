@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Door Monitor - Watches a door and sends alerts when it opens/closes
-Supports SSH commands and CloudWatch logging
+Supports SSH commands and CloudWatch logging with AWS role assumption
 """
 
 import json
@@ -71,10 +71,13 @@ class DoorMonitor:
             
             # CloudWatch
             'use_cloudwatch': config.getboolean('cloudwatch', 'enabled', fallback=False),
+            'aws_role': config.get('cloudwatch', 'aws_role', fallback='arn:aws:iam::448355772178:role/plexus-venue-health-check-cloudwatch-role'),
+            'aws_region': config.get('cloudwatch', 'aws_region', fallback='us-west-2'),
+            'namespace': config.get('cloudwatch', 'namespace', fallback='DoorStateMonitoring'),
             'log_group': config.get('cloudwatch', 'log_group', fallback='door-sensor'),
             'log_stream': config.get('cloudwatch', 'log_stream', fallback='door-events'),
-            'aws_region': config.get('cloudwatch', 'region', fallback='us-east-1'),
-            'door_location': config.get('cloudwatch', 'door_location', fallback='FrontDoor')
+            'door_location': config.get('cloudwatch', 'door_location', fallback='FrontDoor'),
+            'device_id': config.get('cloudwatch', 'device_id', fallback='door-sensor-01')
         }
     
     def setup_logging(self):
@@ -96,28 +99,70 @@ class DoorMonitor:
         
         return logger
     
+    def assume_role(self):
+        """Assume AWS role and return credentials"""
+        try:
+            # Create STS client
+            sts_client = boto3.client('sts', region_name=self.settings['aws_region'])
+            
+            # Assume role
+            response = sts_client.assume_role(
+                RoleArn=self.settings['aws_role'],
+                RoleSessionName='door-sensor-monitor',
+                DurationSeconds=3600  # 1 hour
+            )
+            
+            credentials = response['Credentials']
+            self.logger.info(f"Successfully assumed role: {self.settings['aws_role']}")
+            
+            return {
+                'aws_access_key_id': credentials['AccessKeyId'],
+                'aws_secret_access_key': credentials['SecretAccessKey'],
+                'aws_session_token': credentials['SessionToken'],
+                'region_name': self.settings['aws_region']
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to assume role {self.settings['aws_role']}: {e}")
+            return None
+    
     def setup_cloudwatch(self):
-        """Setup CloudWatch logging if configured"""
+        """Setup CloudWatch logging and metrics with role assumption"""
         if not self.settings['use_cloudwatch'] or not boto3:
             return None
             
         try:
-            client = boto3.client('logs', region_name=self.settings['aws_region'])
+            # Assume role and get credentials
+            credentials = self.assume_role()
+            if not credentials:
+                return None
+            
+            # Create CloudWatch clients with assumed role credentials
+            logs_client = boto3.client('logs', **credentials)
+            metrics_client = boto3.client('cloudwatch', **credentials)
             
             # Create log group and stream if they don't exist
             for method, name in [('create_log_group', self.settings['log_group']), 
                                ('create_log_stream', self.settings['log_stream'])]:
                 try:
                     if method == 'create_log_group':
-                        client.create_log_group(logGroupName=name)
+                        logs_client.create_log_group(logGroupName=name)
                     else:
-                        client.create_log_stream(logGroupName=self.settings['log_group'], logStreamName=name)
+                        logs_client.create_log_stream(
+                            logGroupName=self.settings['log_group'], 
+                            logStreamName=self.settings['log_stream']
+                        )
                 except ClientError as e:
                     if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
                         raise
             
-            self.logger.info("CloudWatch logging enabled")
-            return client
+            self.logger.info("CloudWatch logging enabled with role-based authentication")
+            return {
+                'logs': logs_client,
+                'metrics': metrics_client,
+                'credentials': credentials
+            }
+            
         except Exception as e:
             self.logger.warning(f"CloudWatch setup failed: {e}")
             return None
@@ -187,7 +232,7 @@ class DoorMonitor:
         return GPIO.input(self.settings['door_pin']) != self.door_closed_value
     
     def send_to_cloudwatch(self, door_state):
-        """Send door state to CloudWatch logs"""
+        """Send door state to CloudWatch logs and metrics"""
         if not self.cloudwatch:
             return
             
@@ -195,6 +240,7 @@ class DoorMonitor:
             timestamp = datetime.utcnow()
             metric_value = 1 if door_state == "OPEN" else 0
             
+            # Send to CloudWatch Logs
             log_entry = {
                 'timestamp': int(timestamp.timestamp() * 1000),
                 'message': json.dumps({
@@ -203,6 +249,10 @@ class DoorMonitor:
                         {
                             'Name': 'Location',
                             'Value': self.settings['door_location']
+                        },
+                        {
+                            'Name': 'DeviceId',
+                            'Value': self.settings['device_id']
                         }
                     ],
                     'Value': metric_value,
@@ -211,14 +261,43 @@ class DoorMonitor:
                 })
             }
             
-            self.cloudwatch.put_log_events(
+            self.cloudwatch['logs'].put_log_events(
                 logGroupName=self.settings['log_group'],
                 logStreamName=self.settings['log_stream'],
                 logEvents=[log_entry]
             )
-            self.logger.debug(f"Sent CloudWatch log: DoorState={metric_value}")
+            
+            # Send to CloudWatch Metrics
+            self.cloudwatch['metrics'].put_metric_data(
+                Namespace=self.settings['namespace'],
+                MetricData=[
+                    {
+                        'MetricName': 'DoorState',
+                        'Dimensions': [
+                            {
+                                'Name': 'Location',
+                                'Value': self.settings['door_location']
+                            },
+                            {
+                                'Name': 'DeviceId',
+                                'Value': self.settings['device_id']
+                            }
+                        ],
+                        'Value': metric_value,
+                        'Unit': 'None',
+                        'Timestamp': timestamp
+                    }
+                ]
+            )
+            
+            self.logger.debug(f"Sent CloudWatch data: DoorState={metric_value} to namespace {self.settings['namespace']}")
+            
         except Exception as e:
             self.logger.warning(f"CloudWatch logging failed: {e}")
+            # Try to refresh credentials if they might have expired
+            if "expired" in str(e).lower() or "invalid" in str(e).lower():
+                self.logger.info("Attempting to refresh AWS credentials")
+                self.cloudwatch = self.setup_cloudwatch()
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def run_ssh_command(self, command):
@@ -274,7 +353,7 @@ class DoorMonitor:
         console_msg = f"[{time_str}] Door {state}{maintenance_note}"
         print(console_msg)
         
-        # CloudWatch logging - simple format
+        # CloudWatch logging and metrics
         self.send_to_cloudwatch(state)
         
         # Execute SSH command
