@@ -6,8 +6,8 @@ After=multi-user.target
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi
-ExecStart=/usr/bin/python3 /home/pi/door_sensor_daemon.py
+WorkingDirectory=/opt/hitl-tools/src/
+ExecStart=/usr/bin/python3 /opt/hitl-tools/src/door_sensor_daemon.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
